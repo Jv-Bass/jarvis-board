@@ -1,5 +1,5 @@
-// Jarvis-Board Database Schema
-// Run this in Supabase SQL Editor
+-- Jarvis-Board Database Schema
+-- Run this in Supabase SQL Editor
 
 -- Enable UUID extension
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
