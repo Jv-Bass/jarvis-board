@@ -1,5 +1,5 @@
--- Jarvis-Board Database Schema
--- Run this in Supabase SQL Editor
+// Jarvis-Board Database Schema
+// Run this in Supabase SQL Editor
 
 -- Enable UUID extension
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   due_date DATE,
   blocker_reason TEXT,
   tags TEXT[] DEFAULT '{}',
+  position INTEGER DEFAULT 0,
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW(),
   moved_to_doing_at TIMESTAMPTZ,
@@ -42,21 +43,32 @@ ALTER TABLE tasks ENABLE ROW LEVEL SECURITY;
 ALTER TABLE activity_log ENABLE ROW LEVEL SECURITY;
 ALTER TABLE settings ENABLE ROW LEVEL SECURITY;
 
--- Public read access (for authenticated users)
+-- Public read/write access (for authenticated users and anon)
+DROP POLICY IF EXISTS "Allow public read tasks" ON tasks;
+DROP POLICY IF EXISTS "Allow public insert tasks" ON tasks;
+DROP POLICY IF EXISTS "Allow public update tasks" ON tasks;
+DROP POLICY IF EXISTS "Allow public delete tasks" ON tasks;
+
 CREATE POLICY "Allow public read tasks" ON tasks FOR SELECT USING (true);
+CREATE POLICY "Allow public insert tasks" ON tasks FOR INSERT WITH CHECK (true);
+CREATE POLICY "Allow public update tasks" ON tasks FOR UPDATE USING (true);
+CREATE POLICY "Allow public delete tasks" ON tasks FOR DELETE USING (true);
+
+-- Activity log policies
+DROP POLICY IF EXISTS "Allow public read activity" ON activity_log;
+DROP POLICY IF EXISTS "Allow public insert activity" ON activity_log;
+
 CREATE POLICY "Allow public read activity" ON activity_log FOR SELECT USING (true);
+CREATE POLICY "Allow public insert activity" ON activity_log FOR INSERT WITH CHECK (true);
+
+-- Settings policies
+DROP POLICY IF EXISTS "Allow public read settings" ON settings;
+DROP POLICY IF EXISTS "Allow public update settings" ON settings;
+DROP POLICY IF EXISTS "Allow public insert settings" ON settings;
+
 CREATE POLICY "Allow public read settings" ON settings FOR SELECT USING (true);
-
--- Allow authenticated users to modify
-CREATE POLICY "Allow authenticated insert tasks" ON tasks FOR INSERT WITH CHECK (auth.role() = 'authenticated' OR auth.role() IS NULL);
-CREATE POLICY "Allow authenticated update tasks" ON tasks FOR UPDATE USING (auth.role() = 'authenticated' OR auth.role() IS NULL);
-CREATE POLICY "Allow authenticated delete tasks" ON tasks FOR DELETE USING (auth.role() = 'authenticated');
-
-CREATE POLICY "Allow authenticated insert activity" ON activity_log FOR INSERT WITH CHECK (auth.role() = 'authenticated' OR auth.role() IS NULL);
-CREATE POLICY "Allow authenticated update activity" ON activity_log FOR UPDATE USING (auth.role() = 'authenticated' OR auth.role() IS NULL);
-
-CREATE POLICY "Allow authenticated update settings" ON settings FOR UPDATE USING (auth.role() = 'authenticated' OR auth.role() IS NULL);
-CREATE POLICY "Allow authenticated insert settings" ON settings FOR INSERT WITH CHECK (auth.role() = 'authenticated' OR auth.role() IS NULL);
+CREATE POLICY "Allow public update settings" ON settings FOR UPDATE USING (true);
+CREATE POLICY "Allow public insert settings" ON settings FOR INSERT WITH CHECK (true);
 
 -- Insert default settings
 INSERT INTO settings (key, value) VALUES 
@@ -65,15 +77,11 @@ INSERT INTO settings (key, value) VALUES
 ON CONFLICT (key) DO NOTHING;
 
 -- Create indexes
-CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
-CREATE INDEX IF NOT EXISTS idx_tasks_priority ON tasks(priority);
-CREATE INDEX IF NOT EXISTS idx_tasks_due_date ON tasks(due_date);
-CREATE INDEX IF NOT EXISTS idx_activity_task_id ON activity_log(task_id);
+DROP INDEX IF EXISTS idx_tasks_status_position;
+DROP INDEX IF EXISTS idx_tasks_status;
 
--- Add some sample tasks for testing
-INSERT INTO tasks (title, description, expectations, priority, status, tags) VALUES
-  ('Set up Jarvis-Board deployment', 'Deploy the Jarvis-Board app to Vercel', 'App accessible at vercel.app URL', 1, 'doing', '["deployment", "frontend"]'),
-  ('Configure Supabase database', 'Set up Supabase project with required tables', 'Database tables created and accessible', 2, 'backlog', '["backend", "database"]'),
-  ('Add authentication', 'Implement password-based authentication', 'Login page working with password gate', 1, 'backlog', '["backend", "security"]');
+CREATE INDEX idx_tasks_status_position ON tasks(status, position);
+CREATE INDEX idx_tasks_due_date ON tasks(due_date);
+CREATE INDEX idx_activity_task_id ON activity_log(task_id);
 
-SELECT 'Jarvis-Board Database Schema Created Successfully!' as result;
+SELECT '✅ Jarvis-Board Database Schema Created Successfully!' as result;

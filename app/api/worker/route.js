@@ -1,106 +1,89 @@
-// Background worker API - runs on Vercel cron
+// Jarvis-Board Background Worker - STRICT RULES
+// Priority = Vertical Order (position field)
+// Exactly ONE in "Currently Doing" at all times
 import { NextResponse } from 'next/server'
 import { supabase } from '@/lib/supabase'
 
-// Discord webhook for notifications
 const DISCORD_WEBHOOK = process.env.DISCORD_WEBHOOK || ''
 
 export async function POST(request) {
   try {
-    // Verify cron secret
     const cronSecret = request.headers.get('x-cron-secret')
     if (cronSecret !== process.env.CRON_SECRET && process.env.NODE_ENV === 'production') {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
 
     const results = {
-      checked: 0,
+      timestamp: new Date().toISOString(),
       actions: [],
       errors: [],
     }
 
-    // 1. Find tasks in "doing" status
-    const { data: doingTasks, error: doingError } = await supabase
+    // RULE: Get all tasks ordered by position (top = highest priority)
+    const { data: allTasks, error: fetchError } = await supabase
       .from('tasks')
       .select('*')
-      .eq('status', 'doing')
+      .in('status', ['backlog', 'this_week', 'doing', 'blocked', 'done'])
+      .order('status')
+      .order('position', { ascending: true })
 
-    if (doingError) {
-      results.errors.push(`Error fetching doing tasks: ${doingError.message}`)
-    } else {
-      results.checked += doingTasks.length
+    if (fetchError) {
+      results.errors.push(`Fetch error: ${fetchError.message}`)
+      return NextResponse.json(results, { status: 500 })
+    }
 
-      // Check for aging tasks
-      const agingThreshold = 4 // hours
-      for (const task of doingTasks) {
-        if (task.moved_to_doing_at) {
-          const hoursInStatus = (Date.now() - new Date(task.moved_to_doing_at).getTime()) / (1000 * 60 * 60)
-          
-          if (hoursInStatus > agingThreshold) {
-            results.actions.push({
-              task: task.title,
-              action: 'aging_alert',
-              hours: hoursInStatus.toFixed(1),
-            })
-            
-            // Send notification (would integrate with Discord in production)
-            await sendNotification({
-              type: 'aging',
-              task: task.title,
-              hours: hoursInStatus.toFixed(1),
-            })
-          }
-        }
+    // Separate tasks by status
+    const doingTasks = allTasks.filter(t => t.status === 'doing')
+    const thisWeekTasks = allTasks.filter(t => t.status === 'this_week')
+    const backlogTasks = allTasks.filter(t => t.status === 'backlog')
+    const blockedTasks = allTasks.filter(t => t.status === 'blocked')
+
+    // RULE: WIP LIMIT - Exactly ONE in "Currently Doing"
+    if (doingTasks.length > 1) {
+      // Keep topmost (first), move others back to This Week
+      const keepTask = doingTasks[0]
+      const moveTasks = doingTasks.slice(1)
+
+      for (const task of moveTasks) {
+        await supabase
+          .from('tasks')
+          .update({ status: 'this_week', updated_at: new Date().toISOString() })
+          .eq('id', task.id)
+
+        await supabase.from('activity_log').insert({
+          task_id: task.id,
+          action: 'wip_limit_enforced',
+          details: { reason: 'More than 1 in Doing', moved_to: 'this_week' }
+        })
+
+        results.actions.push({ task: task.title, action: 'moved_to_this_week', reason: 'WIP limit' })
       }
     }
 
-    // 2. Find tasks in "blocked" status
-    const { data: blockedTasks, error: blockedError } = await supabase
+    // Get fresh list after WIP enforcement
+    const { data: freshTasks } = await supabase
       .from('tasks')
       .select('*')
-      .eq('status', 'blocked')
+      .in('status', ['doing', 'this_week', 'backlog'])
+      .order('status')
+      .order('position', { ascending: true })
 
-    if (blockedError) {
-      results.errors.push(`Error fetching blocked tasks: ${blockedError.message}`)
-    } else {
-      results.checked += blockedTasks.length
+    const freshDoing = freshTasks.filter(t => t.status === 'doing')
+    const freshThisWeek = freshTasks.filter(t => t.status === 'this_week')
+    const freshBacklog = freshTasks.filter(t => t.status === 'backlog')
 
-      // Check for long-blocked tasks
-      const blockedThreshold = 1 // hours
-      for (const task of blockedTasks) {
-        if (task.updated_at) {
-          const hoursInStatus = (Date.now() - new Date(task.updated_at).getTime()) / (1000 * 60 * 60)
-          
-          if (hoursInStatus > blockedThreshold) {
-            results.actions.push({
-              task: task.title,
-              action: 'still_blocked',
-              reason: task.blocker_reason,
-              hours: hoursInStatus.toFixed(1),
-            })
+    // RULE: If "Currently Doing" is empty, pull next highest priority
+    if (freshDoing.length === 0) {
+      // Priority: This Week > Backlog
+      let nextTask = null
 
-            await sendNotification({
-              type: 'still_blocked',
-              task: task.title,
-              reason: task.blocker_reason,
-              hours: hoursInStatus.toFixed(1),
-            })
-          }
-        }
+      if (freshThisWeek.length > 0) {
+        nextTask = freshThisWeek[0] // Topmost in This Week
+        results.actions.push({ from: 'this_week', task: nextTask.title, action: 'auto_started' })
+      } else if (freshBacklog.length > 0) {
+        nextTask = freshBacklog[0] // Topmost in Backlog
+        results.actions.push({ from: 'backlog', task: nextTask.title, action: 'auto_started' })
       }
-    }
-
-    // 3. Auto-start next task if nothing in "doing"
-    if (!doingTasks || doingTasks.length === 0) {
-      // Find highest priority task that's not done
-      const { data: nextTask } = await supabase
-        .from('tasks')
-        .select('*')
-        .in('status', ['backlog', 'this_week'])
-        .order('priority', { ascending: true })
-        .order('created_at', { ascending: true })
-        .limit(1)
-        .single()
 
       if (nextTask) {
         await supabase
@@ -108,15 +91,17 @@ export async function POST(request) {
           .update({
             status: 'doing',
             moved_to_doing_at: new Date().toISOString(),
-            updated_at: new Date().toISOString(),
+            updated_at: new Date().toISOString()
           })
           .eq('id', nextTask.id)
 
-        results.actions.push({
-          task: nextTask.title,
-          action: 'auto_started',
+        await supabase.from('activity_log').insert({
+          task_id: nextTask.id,
+          action: 'task_auto_started',
+          details: { source: nextTask.status }
         })
 
+        // Send notification
         await sendNotification({
           type: 'task_started',
           task: nextTask.title,
@@ -124,16 +109,66 @@ export async function POST(request) {
       }
     }
 
-    return NextResponse.json({
-      success: true,
-      ...results,
-      timestamp: new Date().toISOString(),
-    })
+    // Check aging for tasks in "Doing"
+    const { data: currentDoing } = await supabase
+      .from('tasks')
+      .select('*')
+      .eq('status', 'doing')
+
+    const agingThreshold = 4 // hours
+
+    for (const task of currentDoing || []) {
+      if (task.moved_to_doing_at) {
+        const hoursInStatus = (Date.now() - new Date(task.moved_to_doing_at).getTime()) / (1000 * 60 * 60)
+
+        if (hoursInStatus > agingThreshold) {
+          results.actions.push({
+            task: task.title,
+            action: 'aging_alert',
+            hours: hoursInStatus.toFixed(1)
+          })
+
+          await sendNotification({
+            type: 'aging',
+            task: task.title,
+            hours: hoursInStatus.toFixed(1)
+          })
+        }
+      }
+    }
+
+    // Check blocked tasks
+    const { data: currentBlocked } = await supabase
+      .from('tasks')
+      .select('*')
+      .eq('status', 'blocked')
+
+    const blockedThreshold = 1 // hours
+
+    for (const task of currentBlocked || []) {
+      if (task.updated_at) {
+        const hoursBlocked = (Date.now() - new Date(task.updated_at).getTime()) / (1000 * 60 * 60)
+
+        if (hoursBlocked > blockedThreshold) {
+          results.actions.push({
+            task: task.title,
+            action: 'still_blocked',
+            hours: hoursBlocked.toFixed(1)
+          })
+
+          await sendNotification({
+            type: 'still_blocked',
+            task: task.title,
+            reason: task.blocker_reason,
+            hours: hoursBlocked.toFixed(1)
+          })
+        }
+      }
+    }
+
+    return NextResponse.json({ success: true, ...results })
   } catch (error) {
-    return NextResponse.json({ 
-      error: error.message,
-      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
-    }, { status: 500 })
+    return NextResponse.json({ error: error.message }, { status: 500 })
   }
 }
 
@@ -142,7 +177,7 @@ async function sendNotification({ type, task, hours, reason }) {
 
   const messages = {
     aging: `⚠️ **Task Aging Alert**\n"${task}" has been in progress for ${hours} hours!`,
-    still_blocked: `🚫 **Still Blocked**\n"${task}" - ${reason || 'No reason provided'} (${hours}h)`,
+    still_blocked: `🚫 **Still Blocked**\n"${task}" - ${reason || 'No reason'} (${hours}h)`,
     task_started: `▶️ **New Task Started**\nWorking on: "${task}"`,
   }
 
@@ -150,11 +185,9 @@ async function sendNotification({ type, task, hours, reason }) {
     await fetch(DISCORD_WEBHOOK, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        content: messages[type] || `Task update: ${task}`,
-      }),
+      body: JSON.stringify({ content: messages[type] || `Update: ${task}` }),
     })
   } catch (e) {
-    console.error('Failed to send notification:', e)
+    console.error('Notification failed:', e)
   }
 }

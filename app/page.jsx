@@ -1,7 +1,8 @@
 'use client'
 
 import { useState, useEffect } from 'react'
-import { DndContext, DragOverlay, closestCorners, pointerWithin } from '@dnd-kit/core'
+import { DndContext, DragOverlay, closestCorners, pointerWithin, closestCenter } from '@dnd-kit/core'
+import { arrayMove, sortableKeyboardCoordinates } from '@dnd-kit/sortable'
 import Sidebar from '@/components/Sidebar'
 import KanbanColumn from '@/components/KanbanColumn'
 import TaskCard from '@/components/TaskCard'
@@ -20,23 +21,20 @@ export default function KanbanPage() {
   useEffect(() => {
     fetchTasks()
 
-    // Subscribe to realtime changes
     const channel = supabase
       .channel('tasks')
       .on('postgres_changes', { event: '*', schema: 'public', table: 'tasks' }, (payload) => {
         if (payload.eventType === 'INSERT') {
-          setTasks((prev) => [...prev, payload.new])
+          setTasks(prev => [...prev, payload.new])
         } else if (payload.eventType === 'UPDATE') {
-          setTasks((prev) => prev.map((t) => (t.id === payload.new.id ? payload.new : t)))
+          setTasks(prev => prev.map(t => t.id === payload.new.id ? payload.new : t))
         } else if (payload.eventType === 'DELETE') {
-          setTasks((prev) => prev.filter((t) => t.id !== payload.old.id))
+          setTasks(prev => prev.filter(t => t.id !== payload.old.id))
         }
       })
       .subscribe()
 
-    return () => {
-      supabase.removeChannel(channel)
-    }
+    return () => { supabase.removeChannel(channel) }
   }, [])
 
   const fetchTasks = async () => {
@@ -44,8 +42,8 @@ export default function KanbanPage() {
     const { data, error } = await supabase
       .from('tasks')
       .select('*')
-      .order('priority', { ascending: true })
-      .order('created_at', { ascending: false })
+      .order('status')
+      .order('position', { ascending: true })
 
     if (!error && data) {
       setTasks(data)
@@ -55,7 +53,7 @@ export default function KanbanPage() {
 
   const handleDragStart = (event) => {
     const { active } = event
-    const task = tasks.find((t) => t.id === active.id)
+    const task = tasks.find(t => t.id === active.id)
     setActiveTask(task)
   }
 
@@ -68,25 +66,33 @@ export default function KanbanPage() {
     const taskId = active.id
     const newStatus = over.id
 
-    const task = tasks.find((t) => t.id === taskId)
+    const task = tasks.find(t => t.id === taskId)
     if (!task || task.status === newStatus) return
 
-    // Optimistic update
-    setTasks((prev) =>
-      prev.map((t) =>
-        t.id === taskId
-          ? {
-              ...t,
-              status: newStatus,
-              moved_to_doing_at: newStatus === 'doing' ? new Date().toISOString() : t.moved_to_doing_at,
-            }
-          : t
-      )
-    )
+    // Get tasks in the destination column
+    const destTasks = tasks.filter(t => t.status === newStatus && t.id !== taskId)
+    
+    // Calculate new position (top of column = 0, next = 10, etc.)
+    const newPosition = destTasks.length > 0 
+      ? Math.min(...destTasks.map(t => t.position || 0)) - 10 
+      : 0
 
-    // Update in database
+    // Optimistic update
+    setTasks(prev => prev.map(t => 
+      t.id === taskId 
+        ? { 
+            ...t, 
+            status: newStatus, 
+            position: newPosition,
+            moved_to_doing_at: newStatus === 'doing' ? new Date().toISOString() : t.moved_to_doing_at 
+          } 
+        : t
+    ))
+
+    // Database update
     const updates = {
       status: newStatus,
+      position: newPosition,
       updated_at: new Date().toISOString(),
     }
 
@@ -100,8 +106,37 @@ export default function KanbanPage() {
     await supabase.from('activity_log').insert({
       task_id: taskId,
       action: 'status_changed',
-      details: { from: task.status, to: newStatus },
+      details: { from: task.status, to: newStatus, position: newPosition }
     })
+
+    // WIP LIMIT ENFORCEMENT: If moved to "doing", ensure only 1
+    if (newStatus === 'doing') {
+      await enforceWIPLimit()
+    }
+  }
+
+  const enforceWIPLimit = async () => {
+    const doingTasks = tasks.filter(t => t.status === 'doing' && t.id !== activeTask?.id)
+    
+    if (doingTasks.length > 0) {
+      // Keep the topmost (lowest position number), move others to This Week
+      const sorted = [...doingTasks].sort((a, b) => (a.position || 0) - (b.position || 0))
+      const keep = sorted[0]
+      const moveOthers = sorted.slice(1)
+
+      for (const task of moveOthers) {
+        await supabase
+          .from('tasks')
+          .update({ status: 'this_week', updated_at: new Date().toISOString() })
+          .eq('id', task.id)
+
+        await supabase.from('activity_log').insert({
+          task_id: task.id,
+          action: 'wip_limit_enforced',
+          details: { reason: 'More than 1 in Doing' }
+        })
+      }
+    }
   }
 
   const handleTaskClick = (task) => {
@@ -116,7 +151,6 @@ export default function KanbanPage() {
 
   const handleSaveTask = async (taskData) => {
     if (taskData.id) {
-      // Update existing task
       const { error } = await supabase
         .from('tasks')
         .update({
@@ -133,10 +167,19 @@ export default function KanbanPage() {
         })
       }
     } else {
-      // Create new task
+      // Get max position for new task
+      const backlogTasks = tasks.filter(t => t.status === 'backlog')
+      const maxPos = backlogTasks.length > 0 
+        ? Math.max(...backlogTasks.map(t => t.position || 0)) + 10 
+        : 0
+
       const { data, error } = await supabase
         .from('tasks')
-        .insert([{ ...taskData, created_by: 'boss' }])
+        .insert([{ 
+          ...taskData, 
+          created_by: 'boss',
+          position: maxPos
+        }])
         .select()
         .single()
 
@@ -154,7 +197,7 @@ export default function KanbanPage() {
   }
 
   const handleDeleteTask = async (taskId) => {
-    if (confirm('Are you sure you want to delete this task?')) {
+    if (confirm('Delete this task?')) {
       await supabase.from('tasks').delete().eq('id', taskId)
       setModalOpen(false)
       setEditingTask(null)
@@ -162,13 +205,15 @@ export default function KanbanPage() {
   }
 
   const getTasksByStatus = (status) => {
-    return tasks.filter((t) => t.status === status)
+    return tasks
+      .filter(t => t.status === status)
+      .sort((a, b) => (a.position || 0) - (b.position || 0))
   }
 
   const getTaskCounts = () => {
     const counts = {}
-    COLUMNS.forEach((col) => {
-      counts[col] = tasks.filter((t) => t.status === col).length
+    COLUMNS.forEach(col => {
+      counts[col] = tasks.filter(t => t.status === col).length
     })
     return counts
   }
@@ -178,7 +223,6 @@ export default function KanbanPage() {
       <Sidebar taskCounts={getTaskCounts()} />
 
       <main className="ml-64 p-8">
-        {/* Header */}
         <div className="flex items-center justify-between mb-8">
           <div>
             <h1 className="font-orbitron text-3xl font-bold text-white">Kanban Board</h1>
@@ -189,20 +233,18 @@ export default function KanbanPage() {
           </button>
         </div>
 
-        {/* Loading */}
         {loading ? (
           <div className="flex items-center justify-center h-64">
             <div className="animate-spin rounded-full h-12 w-12 border-t-2 border-b-2 border-jarvis-cyan"></div>
           </div>
         ) : (
-          /* Kanban Board */
           <DndContext
-            collisionDetection={closestCorners}
+            collisionDetection={closestCenter}
             onDragStart={handleDragStart}
             onDragEnd={handleDragEnd}
           >
             <div className="flex gap-4 overflow-x-auto pb-4">
-              {COLUMNS.map((status) => (
+              {COLUMNS.map(status => (
                 <KanbanColumn
                   key={status}
                   status={status}
@@ -219,7 +261,6 @@ export default function KanbanPage() {
         )}
       </main>
 
-      {/* Task Modal */}
       {modalOpen && (
         <TaskModal
           task={editingTask}
